@@ -11,15 +11,12 @@ from a2a.client.errors import A2AClientError, A2AClientJSONRPCError
 from a2a.client.middleware import ClientCallContext
 from a2a.client.transports import ClientTransport
 from a2a.extensions.common import find_extension_by_uri
-from a2a.types import (AgentCapabilities, AgentCard, AgentExtension, Artifact,
-                       ContentTypeNotSupportedError, DataPart,
-                       DeleteTaskPushNotificationConfigParams, FilePart,
-                       FileWithBytes, FileWithUri,
+from a2a.types import (AgentCapabilities, AgentCard, AgentExtension,
+                       AgentSkill, Artifact, ContentTypeNotSupportedError,
+                       DataPart, FilePart, FileWithBytes, FileWithUri,
                        GetTaskPushNotificationConfigParams, JSONRPCError,
-                       JSONRPCErrorResponse,
-                       ListTaskPushNotificationConfigParams, Message,
-                       MessageSendParams, Part, Role, Task,
-                       TaskArtifactUpdateEvent, TaskIdParams,
+                       JSONRPCErrorResponse, Message, MessageSendParams, Part,
+                       Role, Task, TaskArtifactUpdateEvent, TaskIdParams,
                        TaskPushNotificationConfig, TaskQueryParams, TaskState,
                        TaskStatus, TaskStatusUpdateEvent, TextPart,
                        UnsupportedOperationError)
