@@ -38,7 +38,7 @@ TERMINAL_TASK_STATES = {
 
 @trace_class(kind=SpanKind.SERVER)
 class InteractionsAPIProxyRequestHandler(RequestHandler):
-    """Default request handler for all incoming requests.
+    """Request handler for all incoming requests to Interactions API Proxy.
 
     This handler provides default implementations for all A2A JSON-RPC methods,
     coordinating between the `AgentExecutor`, `TaskStore`, `QueueManager`,
@@ -52,16 +52,10 @@ class InteractionsAPIProxyRequestHandler(RequestHandler):
             self,
             interactions_api_transport: InteractionsApiTransport,
     ) -> None:
-        """Initializes the DefaultRequestHandler.
+        """Initializes the InteractionsAPIProxyRequestHandler.
 
         Args:
-            agent_executor: The `AgentExecutor` instance to run agent logic.
-            task_store: The `TaskStore` instance to manage task persistence.
-            queue_manager: The `QueueManager` instance to manage event queues. Defaults to `InMemoryQueueManager`.
-            push_config_store: The `PushNotificationConfigStore` instance for managing push notification configurations. Defaults to None.
-            push_sender: The `PushNotificationSender` instance for sending push notifications. Defaults to None.
-            request_context_builder: The `RequestContextBuilder` instance used
-              to build request contexts. Defaults to `SimpleRequestContextBuilder`.
+            interactions_api_transport: Interactions API Transport object.
         """
         self.interactions_api_transport = interactions_api_transport
 

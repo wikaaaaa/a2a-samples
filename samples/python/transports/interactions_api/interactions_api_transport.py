@@ -10,34 +10,18 @@ from a2a.client.errors import A2AClientJSONRPCError
 from a2a.client.middleware import ClientCallContext
 from a2a.client.transports import ClientTransport
 from a2a.extensions.common import find_extension_by_uri
-from a2a.types import (
-    AgentCapabilities,
-    AgentCard,
-    AgentExtension,
-    Artifact,
-    ContentTypeNotSupportedError,
-    DataPart,
-    FilePart,
-    FileWithBytes,
-    FileWithUri,
-    GetTaskPushNotificationConfigParams,
-    JSONRPCError,
-    JSONRPCErrorResponse,
-    Message,
-    MessageSendParams,
-    Part,
-    Role,
-    Task,
-    TaskArtifactUpdateEvent,
-    TaskIdParams,
-    TaskPushNotificationConfig,
-    TaskQueryParams,
-    TaskState,
-    TaskStatus,
-    TaskStatusUpdateEvent,
-    TextPart,
-    UnsupportedOperationError,
-)
+from a2a.types import (AgentCapabilities, AgentCard, AgentExtension, Artifact,
+                       ContentTypeNotSupportedError, DataPart,
+                       DeleteTaskPushNotificationConfigParams, FilePart,
+                       FileWithBytes, FileWithUri,
+                       GetTaskPushNotificationConfigParams, JSONRPCError,
+                       JSONRPCErrorResponse,
+                       ListTaskPushNotificationConfigParams, Message,
+                       MessageSendParams, Part, Role, Task,
+                       TaskArtifactUpdateEvent, TaskIdParams,
+                       TaskPushNotificationConfig, TaskQueryParams, TaskState,
+                       TaskStatus, TaskStatusUpdateEvent, TextPart,
+                       UnsupportedOperationError)
 
 # --- Mapping Functions (Dict-based) ---
 
@@ -669,6 +653,37 @@ class InteractionsApiTransport(ClientTransport):
                 )
             )
         )
+
+    async def list_task_callback(
+        self,
+        request: ListTaskPushNotificationConfigParams,
+        *,
+        context: ClientCallContext | None = None,
+        extensions: list[str] | None = None,
+    ) -> list[TaskPushNotificationConfig]:
+        raise A2AClientJSONRPCError(
+            JSONRPCErrorResponse(
+                error=UnsupportedOperationError(
+                    message='Push Notifications are not supported by Interactions API transport.'
+                )
+            )
+        )
+  
+    async def delete_task_callback(
+        self,
+        request: DeleteTaskPushNotificationConfigParams,
+        *,
+        context: ClientCallContext | None = None,
+        extensions: list[str] | None = None,
+    ) -> None:
+        raise A2AClientJSONRPCError(
+            JSONRPCErrorResponse(
+                error=UnsupportedOperationError(
+                    message='Push Notifications are not supported by Interactions API transport.'
+                )
+            )
+        )
+    
 
     async def resubscribe(
         self,
