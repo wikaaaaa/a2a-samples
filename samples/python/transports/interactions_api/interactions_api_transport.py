@@ -84,7 +84,7 @@ def _a2a_request_to_interaction(message_params: MessageSendParams, agent_interac
     """Maps an A2A Message to the input structure for creating an Interaction."""
     message = message_params.message
     interaction_data = {
-        'contentList': {'contents': [_part_to_content(p) for p in message.parts]},
+        'interaction': {'contentList': {'contents': [_part_to_content(p) for p in message.parts]}},
         'agentInteraction': agent_interaction,
     }
     if message_params.configuration:
@@ -462,8 +462,8 @@ class InteractionsApiTransport(ClientTransport):
         }
         # Add root-level params if present in extension config
         # Add root-level params if present in extension config
-        if agent := self._agent_interaction.get('agent'):
-            payload['agent'] = agent
+        # if agent := self._agent_interaction.get('agent'):
+        #     payload['agent'] = agent
         if deep_research_config := self._agent_interaction.get('deep_research_config'):
             payload['deepResearchConfig'] = deep_research_config
         if dynamic_config := self._agent_interaction.get('dynamic_config'):
