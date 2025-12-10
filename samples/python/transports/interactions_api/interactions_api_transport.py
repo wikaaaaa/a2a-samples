@@ -1,12 +1,13 @@
 import json
 import os
-import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
+from copy import deepcopy
 from typing import Any
 
 import httpx
+import httpx_sse
 from a2a.client import ClientConfig, ClientFactory
-from a2a.client.errors import A2AClientJSONRPCError
+from a2a.client.errors import A2AClientError, A2AClientJSONRPCError
 from a2a.client.middleware import ClientCallContext
 from a2a.client.transports import ClientTransport
 from a2a.extensions.common import find_extension_by_uri
@@ -80,19 +81,21 @@ def _part_to_content(part: Part) -> dict[str, Any]:
     )
 
 
-def _a2a_request_to_interaction(message_params: MessageSendParams, agent_interaction: dict[str, Any]) -> dict[str, Any]:
+def _a2a_request_to_interaction(
+    message_params: MessageSendParams, stream: bool, base_request: dict[str, Any]
+) -> dict[str, Any]:
     """Maps an A2A Message to the input structure for creating an Interaction."""
     message = message_params.message
-    interaction_data = {
-        'interaction': {'contentList': {'contents': [_part_to_content(p) for p in message.parts]}},
-        'agentInteraction': agent_interaction,
+    request: dict[str, Any] = {
+        'input': [_part_to_content(p) for p in message.parts],
+        'stream': stream,
+        'store': True,
+        'background': True,
     }
-    if message_params.configuration:
-        interaction_data['background'] = not message_params.configuration.blocking
     if message.task_id:
-        interaction_data['previousInteractionId'] = message.task_id
-
-    return interaction_data
+        request['previous_interaction_id'] = message.task_id
+    request.update(base_request)
+    return base_request
 
 
 def _interaction_status_to_a2a_task_state(status_str: str) -> TaskState:
@@ -108,76 +111,66 @@ def _interaction_status_to_a2a_task_state(status_str: str) -> TaskState:
     return mapping.get(status_str, TaskState.unknown)
 
 
-def _thought_to_message(thought_content: dict[str, Any]) -> Message:
-    """Maps an Interactions API thought content to an A2A Message."""
-    thought_parts: list[Part] = []
-    summary = thought_content.get('summary', {})
-    items = summary.get('items', [])
-    for item in items:
-        thought_parts.append(_content_to_part(item))
+def _thought_to_message(index: int, thought: dict[str, Any]) -> Message:
+    summaries = thought.get('summary', {}).get('items', [])
+    return Message(
+        message_id=f'output_{index}', role=Role.agent, parts=[_content_to_part(summary) for summary in summaries]
+    )
 
-    if not thought_parts:
-        raise A2AClientJSONRPCError(
-            JSONRPCErrorResponse(
-                error=ContentTypeNotSupportedError(message=f'Unsupported or empty thought content: {thought_content}')
-            )
-        )
-    return Message(message_id=str(uuid.uuid4()), role=Role.agent, parts=thought_parts)
+
+def _thought_delta_to_message(index: int, thought_summary: dict[str, Any]) -> Message:
+    """Maps an Interactions API thought content to an A2A Message."""
+    return Message(message_id=f'output_{index}', role=Role.agent, parts=[_content_to_part(thought_summary['content'])])
+
+
+def _content_delta_to_artifact(task_id: str, event: dict[str, Any]) -> TaskArtifactUpdateEvent:
+    return TaskArtifactUpdateEvent(
+        append=True,
+        last_chunk=False,
+        task_id=task_id,
+        context_id='',
+        artifact=Artifact(
+            artifact_id=f'output_{event["index"]}',
+            parts=[_content_to_part(event['delta'])],
+            name=f'output-{event["index"]}',
+        ),
+    )
 
 
 def _content_to_part(
     content: dict[str, Any],
 ) -> Part:
     """Maps an Interactions API Content dictionary to an A2A Part object (excluding thoughts)."""
-    if 'text' in content:
-        text_data = content['text']
-        return Part(
-            root=TextPart(
-                text=text_data.get('text', ''),
-                metadata={'annotations': text_data.get('annotations')} if text_data.get('annotations') else {},
-            )
-        )
+    if content['type'] == 'text':
+        md = {'annotations': content.get('annotations')} if 'annotations' in content else None
+        return Part(root=TextPart(text=content['text'], metadata=md))
 
     for blob_type in ['image', 'audio', 'document', 'video']:
-        if blob_type in content:
-            blob_data = content[blob_type]
-
-            mime_type = blob_data.get('mime_type') or f'{blob_type}/unknown'
-            if blob_type == 'document' and not blob_data.get('mime_type'):
+        if content['type'] == blob_type:
+            mime_type = content.get('mime_type') or f'{blob_type}/unknown'
+            if blob_type == 'document' and not content.get('mime_type'):
                 mime_type = 'application/octet-stream'
 
             metadata = {}
-            if 'resolution' in blob_data:
-                metadata['resolution'] = blob_data['resolution']
+            if 'resolution' in content:
+                metadata['resolution'] = content['resolution']
 
-            if 'data' in blob_data:
+            if 'data' in content:
                 return Part(
                     root=FilePart(
-                        file=FileWithBytes(bytes=blob_data['data'], mime_type=mime_type),
+                        file=FileWithBytes(bytes=content['data'], mime_type=mime_type),
                         metadata=metadata if metadata else None,
                     )
                 )
-            elif 'uri' in blob_data:
+            elif 'uri' in content:
                 return Part(
                     root=FilePart(
-                        file=FileWithUri(uri=blob_data['uri'], mime_type=mime_type),
+                        file=FileWithUri(uri=content['uri'], mime_type=mime_type),
                         metadata=metadata if metadata else None,
                     )
                 )
 
-    if 'function' in content:
-        return Part(root=DataPart(data={'function_call': content['function']}))
-
-    if 'functionResponse' in content:
-        return Part(root=DataPart(data={'function_response': content['functionResponse']}))
-
-    raise A2AClientJSONRPCError(
-        JSONRPCErrorResponse(
-            error=ContentTypeNotSupportedError(
-                message=f'Unsupported Interactions API Content type: {list(content.keys())}'
-            )
-        )
-    )
+    return Part(root=DataPart(data={'content': content}))
 
 
 def convert_interaction_to_task(interaction: dict[str, Any]) -> Task:
@@ -189,100 +182,68 @@ def convert_interaction_to_task(interaction: dict[str, Any]) -> Task:
     task_status_state = _interaction_status_to_a2a_task_state(status_str)
 
     a2a_history = []
-    turn_list = interaction.get('turnList', {}).get('turns', [])
 
-    if 'content' in interaction:
-        a2a_history.append(
-            Message(
-                message_id='request', role=Role.user, parts=[_content_to_part(interaction['content'])], task_id=task_id
-            )
-        )
-    elif 'stringContent' in interaction:
-        a2a_history.append(
-            Message(
-                message_id='request',
-                role=Role.user,
-                parts=[Part(root=TextPart(text=interaction['stringContent']))],
-                task_id=task_id,
-            )
-        )
-    elif 'contentList' in interaction:
-        contents = interaction['contentList'].get('contents', [])
-        a2a_history.append(
-            Message(
-                message_id='request',
-                role=Role.user,
-                parts=[_content_to_part(content) for content in contents],
-                task_id=task_id,
-            )
-        )
-
-    for i, turn in enumerate(turn_list):
-        turn_role = Role.user if turn.get('role') == 'user' else Role.agent
-        a2a_message_parts = []
-
-        content_list = turn.get('contentList', {}).get('contents', [])
-        if content_list:
-            for content in content_list:
-                try:
-                    a2a_message_parts.append(_content_to_part(content))
-                except A2AClientJSONRPCError as e:
-                    print(f'Warning: Skipping unsupported history content: {e}')
-                    continue
-        elif turn.get('contentString'):
-            a2a_message_parts.append(Part(root=TextPart(text=turn['contentString'])))
-
-        if a2a_message_parts:
-            a2a_history.append(
-                Message(
-                    message_id=f'{task_id}_turn_{i}',
-                    role=turn_role,
-                    parts=a2a_message_parts,
-                    task_id=task_id,
+    if 'input' in interaction:
+        input_val = interaction['input']
+        # Input is either:
+        # - Bare string
+        # - Content
+        # - List of Content
+        # - List of Turns
+        if isinstance(input_val, list):
+            if len(input_val) > 0:
+                # Seems unlikely there'd be an empty input list, but...
+                if 'role' in input_val[0]:
+                    # Turns.
+                    for i, turn in enumerate(input_val):
+                        part = _content_to_part(turn['content'])
+                        role = Role.user if turn['role'] == 'user' else Role.agent
+                        a2a_history.append(Message(message_id=f'input_{i}', role=role, parts=[part]))
+                else:
+                    a2a_history.append(
+                        Message(
+                            message_id='input_0',
+                            role=Role.user,
+                            parts=[_content_to_part(content) for content in input_val],
+                        )
+                    )
+        else:
+            if isinstance(input_val, str):
+                a2a_history.append(
+                    Message(message_id='input_0', role=Role.user, parts=[Part(root=TextPart(text=input_val))])
                 )
-            )
+            else:
+                a2a_history.append(Message(message_id='input_0', role=Role.user, parts=[_content_to_part(input_val)]))
 
     a2a_artifacts = []
     thought_messages = []
     outputs = interaction.get('outputs', [])
 
     for i, output_content in enumerate(outputs):
-        if 'thought' in output_content:
-            try:
-                thought_msg = _thought_to_message(output_content['thought'])
-                thought_msg.message_id = f'{task_id}_thought_{i}'
-                thought_msg.task_id = task_id
-                thought_messages.append(thought_msg)
-            except A2AClientJSONRPCError:
-                continue
+        if output_content['type'] == 'thought':
+            thought_messages.append(_thought_to_message(i, output_content))
         else:
-            try:
-                a2a_part = _content_to_part(output_content)
-                a2a_artifacts.append(
-                    Artifact(
-                        artifact_id=f'{task_id}_output_{i}',
-                        parts=[a2a_part],
-                        name=f'output-{i}',
-                        metadata={},
-                    )
+            a2a_part = _content_to_part(output_content)
+            a2a_artifacts.append(
+                Artifact(
+                    artifact_id=f'output_{i}',
+                    parts=[a2a_part],
+                    name=f'output-{i}',
                 )
-            except A2AClientJSONRPCError as e:
-                print(f'Warning: Skipping unsupported content type: {e}')
-                continue
+            )
 
     # Append thoughts to history
     a2a_history.extend(thought_messages)
 
-    # Determine status message
+    # Determine status message. This isn't quite right: there may be no active
+    # status message.
     task_status_message: Message | None = None
-    if thought_messages:
-        task_status_message = thought_messages[-1]
 
     # Error handling overrides thought status
     error_obj = interaction.get('error') or status_obj.get('error')
     if error_obj:
         task_status_message = Message(
-            message_id=str(uuid.uuid4()),
+            message_id='error',
             role=Role.agent,
             parts=[Part(root=TextPart(text=json.dumps(error_obj)))],
         )
@@ -314,7 +275,19 @@ class InteractionsApiTransport(ClientTransport):
     _WELL_KNOWN_AGENTS_DESCRIPTIONS: dict[str, str] = {
         'deep-research-preview': 'Agent powered by Google Deep Research Preview',
     }
-    _WELL_KNOWN_AGENTS_SKILLS: dict[str, list[str]] = {}
+    _WELL_KNOWN_AGENTS_SKILLS: dict[str, list[AgentSkill]] = {
+        'deep-research-preview': [
+            AgentSkill(
+                id='research',
+                name='Deep Research',
+                description='In depth research using web searching',
+                examples=['What is the best agent development framework?'],
+                input_modes=['text/plain'],
+                output_modes=['text/plain'],
+                tags=['research'],
+            )
+        ]
+    }
 
     def __init__(self, card: AgentCard, api_key: str | None = None):
         self._card = card
@@ -335,60 +308,45 @@ class InteractionsApiTransport(ClientTransport):
             raise ValueError(
                 'invalid AgentCard: missing required extension; use make_card to create a correctly formatted AgentCard'
             )
-        self._agent_interaction: dict[str, Any] = extension.params['agentInteraction']
+        self._base_request: dict[str, Any] = deepcopy(extension.params)
 
     @classmethod
     def make_card(
         cls,
         url: str,
         agent_name: str,
-        agent_config: dict[str, Any] | None = None,
+        base_request: dict[str, Any] | None = None,
         agent_card_overrides: dict[str, Any] | None = None,
     ) -> AgentCard:
-        # Start with well-known agent config if applicable
-        final_agent_config = cls._WELL_KNOWN_AGENTS_INTERACTION_CONFIG.get(agent_name, {}).copy()
-        if agent_config:
-            final_agent_config.update(agent_config)
-
-        agent_interaction: dict[str, Any] = {
-            'agent': agent_name,
-        }
-        if agent_name == 'deep-research-preview':
-            agent_interaction['deepResearchConfig'] = agent_config
-        else:
-            agent_interaction['dynamicConfig'] = agent_config
-
         # Default AgentCard values
-        card_defaults: dict[str, Any] = {
-            'url': url,
-            'preferred_transport': 'interactions-api',
-            'capabilities': AgentCapabilities(
+        base_request = base_request or {}
+        base_request['agent'] = agent_name
+        card = AgentCard(
+            url=url,
+            preferred_transport='interactions-api',
+            capabilities=AgentCapabilities(
                 streaming=True,
                 extensions=[
                     AgentExtension(
                         uri=cls.EXTENSION_URI,
                         required=True,
-                        params={
-                            'agentInteraction': agent_interaction,
-                        },
+                        params=base_request,
                     )
                 ],
             ),
-            'name': cls._WELL_KNOWN_AGENTS_NAMES.get(agent_name, agent_name),
-            'description': cls._WELL_KNOWN_AGENTS_DESCRIPTIONS.get(
-                agent_name, 'Agent powered by Google Interactions API'
-            ),
-            'default_input_modes': ['text/plain'],
-            'default_output_modes': ['text/plain'],
-            'skills': cls._WELL_KNOWN_AGENTS_SKILLS.get(agent_name, []),
-            'version': '0.1.0',
-        }
+            name=cls._WELL_KNOWN_AGENTS_NAMES.get(agent_name, agent_name),
+            description=cls._WELL_KNOWN_AGENTS_DESCRIPTIONS.get(agent_name, 'Agent powered by Google Interactions API'),
+            default_input_modes=['text/plain'],
+            default_output_modes=['text/plain'],
+            skills=cls._WELL_KNOWN_AGENTS_SKILLS.get(agent_name, []),
+            version='v1beta',
+        )
 
         # Apply overrides
         if agent_card_overrides:
-            card_defaults.update(agent_card_overrides)
+            card = card.model_copy(update=agent_card_overrides)
 
-        return AgentCard(**card_defaults)
+        return card
 
     @classmethod
     def setup(cls, client_config: ClientConfig, client_factory: ClientFactory, api_key: str | None = None):
@@ -454,120 +412,109 @@ class InteractionsApiTransport(ClientTransport):
         context: ClientCallContext | None = None,
         extensions: list[str] | None = None,
     ) -> Task | Message:
-        interaction_input = _a2a_request_to_interaction(request, self._agent_interaction)
-        payload = {
-            'stream': False,
-            'store': True,
-            'interaction': interaction_input['interaction'],
-        }
-        # Add root-level params if present in extension config
-        # Add root-level params if present in extension config
-        # if agent := self._agent_interaction.get('agent'):
-        #     payload['agent'] = agent
-        if deep_research_config := self._agent_interaction.get('deep_research_config'):
-            payload['deepResearchConfig'] = deep_research_config
-        if dynamic_config := self._agent_interaction.get('dynamic_config'):
-            payload['dynamicConfig'] = dynamic_config
-
-        response = await self._make_request(
-            'POST', f'/{self.INTERACTIONS_API_VERSION}/interactions:create', json_data=payload
-        )
+        body = _a2a_request_to_interaction(request, stream=False, base_request=self._base_request)
+        response = await self._make_request('POST', f'/{self.INTERACTIONS_API_VERSION}/interactions', json_data=body)
         return convert_interaction_to_task(response.json())
 
-    async def _process_stream(
+    def _process_event(
         self,
-        response: httpx.Response,
-        initial_task: Task | None = None,
-    ) -> AsyncGenerator[Message | Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent]:
-        current_task = initial_task
-        async for line in response.aiter_lines():
-            if line.startswith('data:'):
-                try:
-                    json_data = json.loads(line[len('data:') :].strip())
-                    event_type = json_data.get('eventType')
-                    event_data = json_data.get('event', {})
-
-                    if not event_type:
-                        continue
-
-                    if event_type == 'InteractionEvent':
-                        if 'interaction' in event_data:
-                            current_task = convert_interaction_to_task(event_data['interaction'])
-                            self._streaming_tasks[current_task.id] = current_task
-                            yield current_task
-                        elif event_data.get('completed') and current_task:
-                            current_task.status.state = TaskState.completed
-                            yield TaskStatusUpdateEvent(
-                                task_id=current_task.id,
-                                context_id=current_task.context_id,
-                                status=current_task.status,
-                                final=True,
-                            )
-                            if current_task.id in self._streaming_tasks:
-                                del self._streaming_tasks[current_task.id]
-
-                    elif event_type == 'InteractionStatusUpdate' and current_task:
-                        status_str = event_data.get('status', 'UNSPECIFIED')
-                        current_task.status.state = _interaction_status_to_a2a_task_state(status_str)
-
-                        error_data = event_data.get('error')
-                        if error_data:
-                            current_task.status.message = Message(
-                                message_id=str(uuid.uuid4()),
-                                role=Role.agent,
-                                parts=[Part(root=TextPart(text=json.dumps(error_data)))],
-                            )
-
-                        yield TaskStatusUpdateEvent(
-                            task_id=current_task.id,
-                            context_id=current_task.context_id,
-                            status=current_task.status,
-                            final=False,
-                        )
-
-                    elif event_type == 'Content' and current_task:
-                        if 'thought' in event_data:
-                            try:
-                                # Convert thought content directly to an A2A Message
-                                thought_message = _map_interaction_thought_to_a2a_message(event_data['thought'])
-                                current_task.status.message = thought_message
-                                yield TaskStatusUpdateEvent(
-                                    task_id=current_task.id,
-                                    context_id=current_task.context_id,
-                                    status=current_task.status,
-                                    final=False,
-                                )
-                            except A2AClientJSONRPCError as e:
-                                print(f'Warning: Skipping unsupported thought content in stream: {e}')
-                        else:
-                            try:
-                                a2a_part = _content_to_part(event_data)
-                                yield TaskArtifactUpdateEvent(
-                                    task_id=current_task.id,
-                                    context_id=current_task.context_id,
-                                    artifact=Artifact(
-                                        artifact_id=str(uuid.uuid4()),
-                                        parts=[a2a_part],
-                                        name='artifact',
-                                        metadata={},
-                                    ),
-                                    last_chunk=False,
-                                )
-                            except A2AClientJSONRPCError as e:
-                                print(f'Warning: Skipping unsupported content in stream: {e}')
-
-                except json.JSONDecodeError:
-                    print(f'Warning: JSON decode error: {line}')
-
-            elif line.strip() == 'event: end' and current_task:
-                if current_task.id in self._streaming_tasks:
-                    del self._streaming_tasks[current_task.id]
-                yield TaskStatusUpdateEvent(
+        event: httpx_sse.ServerSentEvent,
+        current_task: Task,
+        thought_indexes: set,
+    ) -> TaskStatusUpdateEvent | TaskArtifactUpdateEvent | None:
+        event_type = event.event
+        event_data = event.json()
+        if event_type == 'interaction.status_update':
+            new_state = _interaction_status_to_a2a_task_state(event_data['status'])
+            current_task.status = TaskStatus(state=new_state)
+            return TaskStatusUpdateEvent(
+                task_id=current_task.id,
+                context_id='',
+                final=False,
+                status=current_task.status,
+            )
+        elif event_type == 'content.start':
+            # Depends on content. If not thought, emit ArtifactUpdateEvent with
+            # name of "content_{index}". append = True, final = False.
+            # If thought, emit TaskStatusUpdateEvent with most recent status and new message.
+            # Only if content is set. It may not be.
+            if 'content' in event_data:
+                # New thought incoming.
+                if event_data['content']['type'] == 'thought':
+                    thought_indexes.add(event_data['index'])
+                    current_task.status.message = Message(
+                        message_id=f'output_{event_data["index"]}',
+                        task_id=current_task.id,
+                        role=Role.agent,
+                        parts=[],
+                    )
+        elif event_type == 'content.delta':
+            # Emit TaskArtifactUpdatEvent. Otherwise, accumulate
+            # message in-memory.
+            if event_data['delta']['type'] == 'thought_summary':
+                # This should have been setup above.
+                current_status_message = current_task.status.message
+                current_status_message.parts.append(  # type: ignore
+                    _content_to_part(event_data['delta']['conent'])
+                )
+                return TaskStatusUpdateEvent(
                     task_id=current_task.id,
                     context_id=current_task.context_id,
                     status=current_task.status,
-                    final=True,
+                    final=False,
                 )
+            elif event_data['delta']['type'] == 'thought_signature':
+                pass
+            else:
+                return _content_delta_to_artifact(current_task.id, event_data)
+
+        elif event_type == 'content.stop':
+            if event_data['index'] not in thought_indexes:
+                return TaskArtifactUpdateEvent(
+                    task_id=current_task.id,
+                    context_id=current_task.context_id,
+                    artifact=Artifact(
+                        artifact_id=f'output_{event_data["index"]}',
+                        parts=[],
+                        name=f'output-{event_data["index"]}',
+                    ),
+                    last_chunk=True,
+                    append=True,
+                )
+        elif event_type == 'error':
+            # Emit TaskStatusUpdateEvent message with error details.
+            error = event_data['error']
+            current_task.status.message = Message(
+                message_id='error',
+                role=Role.agent,
+                parts=[Part(root=DataPart(data=error))],
+            )
+            return TaskStatusUpdateEvent(
+                task_id=current_task.id,
+                context_id=current_task.context_id,
+                status=current_task.status,
+                final=False,
+            )
+        elif event_type == 'interaction.complete':
+            current_task = convert_interaction_to_task(event_data['interaction'])
+            return TaskStatusUpdateEvent(
+                task_id=current_task.id,
+                context_id=current_task.context_id,
+                status=current_task.status,
+                final=True,
+            )
+
+    async def _process_stream(
+        self,
+        stream: AsyncIterator[httpx_sse.ServerSentEvent],
+        current_task: Task,
+        thought_indexes: set[int],
+    ) -> AsyncGenerator[Message | Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent]:
+        async for event in stream:
+            if event.event == 'done':
+                return
+            if processed := self._process_event(event, current_task, thought_indexes):
+                yield processed
 
     async def send_message_streaming(
         self,
@@ -576,30 +523,27 @@ class InteractionsApiTransport(ClientTransport):
         context: ClientCallContext | None = None,
         extensions: list[str] | None = None,
     ) -> AsyncGenerator[Message | Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent]:
-        interaction_input = _a2a_request_to_interaction(request.message, self._agent_interaction)
-        payload = {
-            'stream': True,
-            'store': True,
-            'interaction': interaction_input['interaction'],
-        }
-        # Add root-level params
-        # Add root-level params if present in extension config
-        if agent := self._agent_interaction.get('agent'):
-            payload['agent'] = agent
-        if deep_research_config := self._agent_interaction.get('deep_research_config'):
-            payload['deepResearchConfig'] = deep_research_config
-        if dynamic_config := self._agent_interaction.get('dynamic_config'):
-            payload['dynamicConfig'] = dynamic_config
+        body = _a2a_request_to_interaction(request, stream=True, base_request=self._base_request)
 
-        async with self._client.stream(
+        async with httpx_sse.aconnect_sse(
+            self._client,
             'POST',
-            f'/{self.INTERACTIONS_API_VERSION}/interactions:createStream',
-            json=payload,
-            headers={'Accept': 'text/event-stream'},
-            timeout=None,
-        ) as response:
-            response.raise_for_status()
-            async for event in self._process_stream(response):
+            f'/{self.INTERACTIONS_API_VERSION}/interactions',
+            json=body,
+        ) as event_source:
+            event_source.response.raise_for_status()
+            stream = event_source.aiter_sse()
+            first_event = await anext(stream)
+            if first_event.event == 'error':
+                raise A2AClientError(first_event.data)
+            elif first_event.event != 'interaction.start':
+                raise A2AClientError(f'unexpected first event type: {first_event.event}')
+            task = convert_interaction_to_task(first_event.json()['interaction'])
+            # Change current state to submitted, since A2A always emits a Task
+            # in submitted state first.
+            task.status.state = TaskState.submitted
+            yield task
+            async for event in self._process_stream(stream, task, set()):
                 yield event
 
     async def get_task(
@@ -609,7 +553,7 @@ class InteractionsApiTransport(ClientTransport):
         context: ClientCallContext | None = None,
         extensions: list[str] | None = None,
     ) -> Task:
-        response = await self._make_request('GET', f'/{self.INTERACTIONS_API_VERSION}/interactions/{request.id}:poll')
+        response = await self._make_request('GET', f'/{self.INTERACTIONS_API_VERSION}/interactions/{request.id}')
         return convert_interaction_to_task(response.json())
 
     async def cancel_task(
@@ -619,10 +563,13 @@ class InteractionsApiTransport(ClientTransport):
         context: ClientCallContext | None = None,
         extensions: list[str] | None = None,
     ) -> Task:
-        response = await self._make_request(
-            'POST', f'/{self.INTERACTIONS_API_VERSION}/interactions/{request.id}:cancel'
+        raise A2AClientJSONRPCError(
+            JSONRPCErrorResponse(
+                error=UnsupportedOperationError(
+                    message='Task cancellation not supported by Interactions API transport.'
+                )
+            )
         )
-        return convert_interaction_to_task(response.json())
 
     async def set_task_callback(
         self,
@@ -692,25 +639,30 @@ class InteractionsApiTransport(ClientTransport):
         context: ClientCallContext | None = None,
         extensions: list[str] | None = None,
     ) -> AsyncGenerator[Message | Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent]:
-        async with self._client.stream(
+        # Snapshot the current state of the Task, then subscribe.
+        current_task = await self.get_task(TaskQueryParams(id=request.id))
+        yield current_task
+        async with httpx_sse.aconnect_sse(
+            self._client,
             'GET',
-            f'/{self.INTERACTIONS_API_VERSION}/interactions/{request.id}:stream',
-            headers={'Accept': 'text/event-stream'},
-            timeout=None,
-        ) as response:
-            response.raise_for_status()
-            current_task: Task | None = self._streaming_tasks.get(request.id)
-            if not current_task:
-                try:
-                    # Sync state first
-                    current_task = await self.get_task(TaskQueryParams(id=request.id))
-                    self._streaming_tasks[request.id] = current_task
-                    yield current_task
-                except Exception as e:
-                    print(f'Error fetching task for resubscribe: {e}')
-                    raise
-
-            async for event in self._process_stream(response, initial_task=current_task):
+            f'/{self.INTERACTIONS_API_VERSION}/interactions/{request.id}',
+            params={'stream': True},
+        ) as event_source:
+            event_source.response.raise_for_status()
+            stream = event_source.aiter_sse()
+            first_event = await anext(stream)
+            if first_event.event == 'error':
+                event_data = first_event.json()
+                if event_data['code'] == 'not_found':
+                    # If a task is complete, Interactions API returns an error
+                    # when trying to stream. A2A always returns the state of the
+                    # Task then stops streaming.
+                    return
+                raise A2AClientError(first_event.data)
+            thought_indexes = set()
+            if processed := self._process_event(first_event, current_task, thought_indexes):
+                yield processed
+            async for event in self._process_stream(stream, current_task, thought_indexes):
                 yield event
 
     async def get_card(
