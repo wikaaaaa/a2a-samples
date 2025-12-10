@@ -1,3 +1,3 @@
-from .interactions_api_transport import InteractionsApiTransport, AgentInteraction
+from .interactions_api_transport import InteractionsApiTransport
 
-__all__ = ['InteractionsApiTransport', 'AgentInteraction']
+__all__ = ['InteractionsApiTransport']

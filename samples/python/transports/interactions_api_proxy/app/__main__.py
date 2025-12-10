@@ -6,17 +6,11 @@ import click
 import httpx
 import uvicorn
 from a2a.server.apps import A2AStarletteApplication
-from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.tasks import (BasePushNotificationSender,
-                              InMemoryPushNotificationConfigStore,
-                              InMemoryTaskStore)
 from a2a.types import AgentCapabilities, AgentCard, AgentSkill
-from app.agent import CurrencyAgent
-from app.agent_executor import CurrencyAgentExecutor
-from app.request_handler import InteractionsAPIProxyRequestHandler
 from dotenv import load_dotenv
-from interactions_api.interactions_api_transport import \
-    InteractionsApiTransport
+from transports.interactions_api import InteractionsApiTransport
+from transports.interactions_api_proxy.app.request_handler import \
+    InteractionsAPIProxyRequestHandler
 
 load_dotenv()
 
@@ -42,7 +36,7 @@ def main(host, port):
 
         interactions_agent_card = InteractionsApiTransport.make_card(
             url='https://generativelanguage.googleapis.com/v1beta/interactions',
-            agent="interactions-api",
+            agent_name="interactions-api",
         )
 
         interaction_api_transport_object = InteractionsApiTransport(
