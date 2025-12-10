@@ -35,7 +35,7 @@ def main(host, port):
             )
 
         interactions_agent_card = InteractionsApiTransport.make_card(
-            url='https://generativelanguage.googleapis.com/v1beta/interactions',
+            url='https://generativelanguage.googleapis.com',
             agent_name="interactions-api",
         )
 
